@@ -5,6 +5,13 @@ try:
 except ImportError:
     ipex_available = False
 
+from bitsandbytes.functional import (
+    get_4bit_type,
+    quantize_blockwise,
+    dequantize_blockwise,
+    QuantState,
+)
+
 Tensor = torch.Tensor
 
 def assert_on_cpu(tensors):
@@ -197,6 +204,245 @@ def mm_dequant_common(
     return out
 
 
+NF4_QUANT_TABLE = [
+    -1.0 - 1e-2,           # 0b0000
+    -0.8480964004993439,   # 0b0001
+    -0.6106329262256622,   # 0b0010
+    -0.4599952697753906,   # 0b0011
+    -0.33967943489551544,  # 0b0100
+    -0.23460740596055984,  # 0b0101
+    -0.13791173323988914,  # 0b0110
+    -0.045525018125772476, # 0b0111
+    0.03979014977812767,   # 0b1000
+    0.1202552504837513,    # 0b1001
+    0.2035212516784668,    # 0b1010
+    0.2920137718319893,    # 0b1011
+    0.3893125355243683,    # 0b1100
+    0.5016634166240692,    # 0b1101
+    0.6427869200706482,    # 0b1110
+    0.8614784181118011,    # 0b1111
+]
+
+
+NF4_DEQUANT_TABLE = [
+    -1.0,
+    -0.6961928009986877,
+    -0.5250730514526367,
+    -0.39491748809814453,
+    -0.28444138169288635,
+    -0.18477343022823334,
+    -0.09105003625154495,
+    0.0,
+    0.07958029955625534,
+    0.16093020141124725,
+    0.24611230194568634,
+    0.33791524171829224,
+    0.44070982933044434,
+    0.5626170039176941,
+    0.7229568362236023,
+    1.0,
+]
+
+
+# Disable torch.compile now due to a bug
+# TODO fix the bug and apply torch.compile here
+# @torch.compile(dynamic=True, options={"fx_graph_cache": True})
+def quantize_4bit_common(
+    A: Tensor,
+    absmax: Tensor = None,
+    out: Tensor = None,
+    blocksize=64,
+    compress_statistics=False,
+    quant_type="nf4",
+) -> Tensor:
+    """
+    Quantize tensor A in blocks of 4-bit values.
+
+    Quantizes tensor A by dividing it into blocks which are independently quantized to FP4.
+
+    Parameters
+    ----------
+    A : torch.Tensor
+        The input tensor.
+    absmax : torch.Tensor
+        The absmax values.
+    out : torch.Tensor
+        The output tensor (8-bit).
+    blocksize : int
+        The blocksize used in quantization.
+    quant_type : str
+        The 4-bit quantization data type {fp4, nf4}, only nf4 is supported now
+
+    Returns
+    -------
+    torch.Tensor:
+        The 8-bit tensor with packed 4-bit values.
+    tuple(torch.Tensor, torch.Size, torch.dtype, int):
+        The quantization state to undo the quantization.
+    """
+    if quant_type != "nf4":
+        raise NotImplementedError(
+            f"4-bit quantization data type {quant_type} is not implemented for CPU/XPU."
+        )
+    n = A.numel()
+    input_shape = A.shape
+    blocks = n // blocksize
+    blocks += 1 if n % blocksize > 0 else 0
+
+    if absmax is None:
+        absmax = torch.zeros((blocks,), device=A.device, dtype=A.dtype)
+
+    if out is None:
+        out = torch.zeros(((n + 1) // 2), dtype=torch.uint8, device=A.device)
+
+    assert blocksize in [4096, 2048, 1024, 512, 256, 128, 64]
+    rem = n % blocksize
+    has_rem = rem > 0
+
+    # Scale tensor to [-1, 1]
+    A_reshaped = A.reshape(n)
+    A_com = A_reshaped[:n - rem]
+    A_com_reshaped = A_com.reshape(n // blocksize, blocksize)
+    absmax[:blocks - has_rem] = torch.abs(A_com_reshaped).max(dim=-1)[0]
+    scaled_A = torch.clamp(A_com_reshaped * (1 / absmax[:blocks - has_rem].view(-1, 1)), -1, 1)
+    scaled_A = scaled_A.reshape(-1)
+    if has_rem:
+        absmax[-1] = torch.abs(A_reshaped[n - rem:]).max()
+        scaled_A_rem = torch.clamp(A_reshaped[n - rem:] * (1 / absmax[-1]), -1, 1)
+        scaled_A = torch.cat([scaled_A, scaled_A_rem], dim=0)
+    # map [-1, 1] to nf4
+    out_uint8 = torch.empty(scaled_A.shape, dtype=torch.uint8)
+    for i in range(len(NF4_QUANT_TABLE)):
+        out_uint8[scaled_A > NF4_QUANT_TABLE[i]] = i
+    if out_uint8.size(-1) % 2:
+        out_uint8 = torch.nn.functional.pad(out_uint8, (0, 1), value=0)
+    out[:] = out_uint8[1::2].bitwise_left_shift(4).bitwise_or_(out_uint8[::2])
+
+    code = get_4bit_type(quant_type, device=A.device)
+
+    if compress_statistics:
+        assert False, "bnb_4bit_use_double_quant is not supported yet for CPU/XPU"
+        offset = absmax.mean()
+        absmax -= offset
+        qabsmax, state2 = quantize_blockwise(absmax, blocksize=256)
+        del absmax
+        state = QuantState(
+            absmax=qabsmax,
+            shape=input_shape,
+            dtype=A.dtype,
+            blocksize=blocksize,
+            code=code,
+            quant_type=quant_type,
+            offset=offset,
+            state2=state2,
+        )
+    else:
+        state = QuantState(
+            absmax=absmax,
+            shape=input_shape,
+            dtype=A.dtype,
+            blocksize=blocksize,
+            code=code,
+            quant_type=quant_type,
+        )
+
+    return out, state
+
+
+# Disable torch.compile now due to a bug
+# TODO fix the bug and apply torch.compile here
+# @torch.compile(dynamic=True, options={"fx_graph_cache": True})
+def dequantize_4bit_common(
+    A: Tensor,
+    quant_state = None,
+    absmax: Tensor = None,
+    out: Tensor = None,
+    blocksize: int = 64,
+    quant_type="nf4",
+) -> Tensor:
+    """
+    Dequantizes FP4 blockwise quantized values.
+
+    Dequantizes the tensor A with maximum absolute values absmax in blocks of size blocksize.
+
+    Parameters
+    ----------
+    A : torch.Tensor
+        The input 8-bit tensor (packed 4-bit values).
+    quant_state : QuantState
+        object with quantisation stats, incl. absmax values, original tensor shape and original dtype.
+    absmax : torch.Tensor
+        The absmax values.
+    out : torch.Tensor
+        Dequantized output tensor.
+    blocksize : int
+        The blocksize used in quantization.
+    quant_type : str
+        The 4-bit quantization data type {fp4, nf4}, only nf4 is supported now
+
+
+    Returns
+    -------
+    torch.Tensor:
+        Dequantized tensor.
+    """
+
+    if quant_state is None:
+        assert absmax is not None and out is not None
+
+        quant_state = QuantState(
+            absmax=absmax,
+            shape=out.shape,
+            dtype=out.dtype,
+            blocksize=blocksize,
+            quant_type=quant_type,
+        )
+
+    else:
+        absmax = quant_state.absmax
+
+    if quant_state.quant_type != "nf4":
+        raise NotImplementedError(
+            f"4-bit quantization data type {quant_state.quant_type} is not implemented for CPU/XPU."
+        )
+
+    if quant_state.nested:
+        assert False, "bnb_4bit_use_double_quant is not supported yet for CPU/XPU"
+        absmax = dequantize_blockwise(quant_state.absmax, quant_state.state2)
+        absmax += quant_state.offset
+        if absmax.dtype != torch.float32:
+            absmax = absmax.float()
+
+    if out is None:
+        out = torch.empty(
+            quant_state.shape, dtype=quant_state.dtype, device=A.device
+        )
+
+    n = out.numel()
+    # Map nf4 to [-1, 1]
+    out_uint8 = torch.empty(A.size(0) * 2, dtype=torch.uint8, device=A.device)
+    out_uint8[::2] = A.bitwise_and(0xF)
+    out_uint8[1::2] = A.bitwise_right_shift(4)
+    out_dq = torch.empty(out_uint8.shape).to(quant_state.dtype)
+    for i in range(len(NF4_DEQUANT_TABLE)):
+        out_dq[out_uint8 == i] = NF4_DEQUANT_TABLE[i]
+
+    # Apply scales
+    if out_dq.numel() != n:
+        assert out_dq.numel() == n + 1
+        out_dq = torch.narrow(out_dq, 0, 0, n)
+    blocks = n // blocksize
+    blocks += 1 if n % blocksize > 0 else 0
+    rem = n % blocksize
+    has_rem = rem > 0
+    out_reshaped = out.reshape(-1)
+    out_reshaped[:n - rem] = (out_dq[:n - rem].view(-1, blocksize) * absmax[:blocks - has_rem].view(-1, 1)).reshape(-1)
+    if has_rem:
+        out_reshaped[n - rem:] = out_dq[n - rem:] * absmax[-1]
+
+    # take transpose here because weight is transposed (again) for computation
+    return out.t()
+
 
 class CPUBackend:
     mm_dequant_compute_dtype = torch.bfloat16
@@ -278,7 +524,8 @@ class CPUBackend:
         compress_statistics=False,
         quant_type="fp4",
     ) -> Tensor:
-        assert False, "quantize_4bit not yet implemented for CPU backend"
+        assert_on_cpu([A, absmax, out])
+        return quantize_4bit_common(A, absmax, out, blocksize, compress_statistics, quant_type)
 
     @classmethod
     def dequantize_4bit(
@@ -290,4 +537,5 @@ class CPUBackend:
         blocksize: int = 64,
         quant_type="fp4",
     ) -> Tensor:
-        assert False, "dequantize_4bit not yet implemented for CPU backend"
+        assert_on_cpu([A, absmax, out])
+        return dequantize_4bit_common(A, quant_state, absmax, out, blocksize, quant_type)

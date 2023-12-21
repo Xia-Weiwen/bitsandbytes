@@ -174,6 +174,26 @@ class Params4bit(torch.nn.Parameter):
 
         return self
 
+    def cpu(self):
+        if self.quant_state is not None:
+            return self
+        w = self.data.contiguous().bfloat16().cpu()
+        w_4bit, quant_state = bnb.functional.quantize_4bit(w, blocksize=self.blocksize, compress_statistics=self.compress_statistics, quant_type=self.quant_type)
+        self.data = w_4bit
+        self.quant_state = quant_state
+
+        return self
+
+    def xpu(self):
+        if self.quant_state is not None:
+            return self
+        w = self.data.contiguous().half().xpu()
+        w_4bit, quant_state = bnb.functional.quantize_4bit(w, blocksize=self.blocksize, compress_statistics=self.compress_statistics, quant_type=self.quant_type)
+        self.data = w_4bit
+        self.quant_state = quant_state
+
+        return self
+
     @overload
     def to(self: T, device: Optional[Union[int, device]] = ..., dtype: Optional[Union[dtype, str]] = ..., non_blocking: bool = ...,) -> T:
         ...
@@ -191,6 +211,10 @@ class Params4bit(torch.nn.Parameter):
 
         if (device is not None and device.type == "cuda" and self.data.device.type == "cpu"):
             return self.cuda(device)
+        if (device is not None and device.type == "cpu" and self.data.dtype != torch.uint8):
+            return self.cpu()
+        if (device is not None and device.type == "xpu" and self.data.dtype != torch.uint8):
+            return self.xpu()
         else:
             if self.quant_state is not None:
                 self.quant_state.to(device)
@@ -327,6 +351,19 @@ class Int8Params(torch.nn.Parameter):
         setattr(self, "SCB", SCB)
         return self
 
+    def xpu(self):
+        # we store the 8-bit rows-major weight
+        B = self.data.contiguous().bfloat16().xpu()
+        CB, CBt, SCB, SCBt, coo_tensorB = bnb.functional.double_quant(B)
+        if CBt is not None:
+            del CBt
+        if SCBt is not None:
+            del SCBt
+        self.data = CB
+        setattr(self, "CB", CB)
+        setattr(self, "SCB", SCB)
+        return self
+
     @overload
     def to(
         self: T,
@@ -361,6 +398,12 @@ class Int8Params(torch.nn.Parameter):
             and self.data.dtype != torch.int8
         ):
             return self.cpu()
+        elif (
+            device is not None
+            and device.type == "xpu"
+            and self.data.dtype != torch.int8
+        ):
+            return self.xpu()
         else:
             new_param = Int8Params(
                 super().to(

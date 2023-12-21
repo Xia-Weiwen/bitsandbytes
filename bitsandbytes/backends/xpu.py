@@ -108,7 +108,8 @@ class XPUBackend:
         compress_statistics=False,
         quant_type="fp4",
     ) -> Tensor:
-        assert False, "quantize_4bit not yet implemented for XPU backend"
+        assert_on_xpu([A, absmax, out])
+        return quantize_4bit_common(A, absmax, out, blocksize, compress_statistics, quant_type)
 
     @classmethod
     def dequantize_4bit(
@@ -120,4 +121,5 @@ class XPUBackend:
         blocksize: int = 64,
         quant_type="fp4",
     ) -> Tensor:
-        assert False, "dequantize_4bit not yet implemented for XPU backend"
+        assert_on_xpu([A, absmax, out])
+        return dequantize_4bit_common(A, quant_state, absmax, out, blocksize, quant_type)
